@@ -1,0 +1,8 @@
+{
+  "name": "Gadwal",
+  "description": "Student course and schedule planning platform for MIU students.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
