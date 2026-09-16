@@ -1,0 +1,125 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1789350836310,
+      "tag": "0000_jittery_roughhouse",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1789352633107,
+      "tag": "0001_previous_thanos",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789360000000,
+      "tag": "0002_launch_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789363600000,
+      "tag": "0003_payment_logic_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789367200000,
+      "tag": "0004_core_logic_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789403235627,
+      "tag": "0005_performance_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789403989442,
+      "tag": "0006_redteam_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1789406000000,
+      "tag": "0007_exhaustive_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1789407200000,
+      "tag": "0008_exhaustive_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789410000000,
+      "tag": "0009_security_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1789413600000,
+      "tag": "0010_student_product_completion",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1789428813056,
+      "tag": "0011_course_set_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789430000000,
+      "tag": "0012_account_deletion_tombstones",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1789431200000,
+      "tag": "0013_admin_audit_log",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789516800000,
+      "tag": "0014_api_db_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1789520400000,
+      "tag": "0015_payment_integrity",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1789550000000,
+      "tag": "0016_business_logic_integrity",
+      "breakpoints": true
+    }
+  ]
+}
