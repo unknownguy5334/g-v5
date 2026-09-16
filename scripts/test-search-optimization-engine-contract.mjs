@@ -1,0 +1,25 @@
+import fs from 'node:fs';
+import path from 'node:path';
+const root = path.resolve(new URL('.', import.meta.url).pathname, '..');
+const optimizer = fs.readFileSync(path.join(root, 'server/optimizer/optimizer.ts'), 'utf8');
+const results = fs.readFileSync(path.join(root, 'src/components/StepResults.tsx'), 'utf8');
+const panel = fs.readFileSync(path.join(root, 'src/components/SchedulePreferencesPanel.tsx'), 'utf8');
+const types = fs.readFileSync(path.join(root, 'src/types.ts'), 'utf8');
+const oldPrefs = ['dayBuckets','freeDays','earliestStartTime','latestEndTime','maxDays','preferCompactDays','useCreditRange','minCredits','maxCredits'];
+let passed=0, total=0;
+function ok(condition,label){ total++; if(condition) {passed++; console.log(`PASS: ${label}`);} else console.error(`FAIL: ${label}`); }
+ok(/targetCourseCount/.test(optimizer) && /targetCredits/.test(optimizer), 'optimizer uses exact course and credit targets');
+ok(/mandatorySubjects/.test(optimizer) && /mandatoryCourseKeys/.test(optimizer), 'mandatory courses are handled');
+ok(/enumerateCourseSubsets/.test(optimizer) && /enumerateSectionCombinations/.test(optimizer), 'course and section search are exhaustive traversals');
+ok(!/return a\.totalGap - b\.totalGap/.test(optimizer) && /getScheduleSignature\(a\)\.localeCompare\(getScheduleSignature\(b\)\)/.test(optimizer), 'ranking within each day group is deterministic and not gap-optimized');
+ok(!/preferCompactDays/.test(optimizer), 'compactness is removed from optimizer');
+ok(!/dayBuckets\.includes/.test(optimizer), 'dayBuckets no longer filters optimizer candidates');
+ok(!/maxDays/.test(optimizer), 'maxDays is removed from optimizer');
+ok(/DEFAULT_DAY_BUCKETS/.test(optimizer), 'all 1..7 day groups are generated');
+ok(/RESULT_LIMIT_PER_DAY = 3/.test(optimizer), 'top 3 per day group');
+ok(/result\[d\] = \[\.\.\.\(optimizerOutput\.byDayCount\[d\]/.test(results), 'results UI preserves optimizer order');
+ok(!/compareSchedulesDeterministically/.test(results), 'results UI does not re-rank schedules');
+ok(!oldPrefs.some((x)=>panel.includes(x)), 'old schedule-preference controls are removed');
+ok(!oldPrefs.some((x)=>types.includes(x)), 'old schedule-preference fields are removed from types');
+console.log(`SEARCH OPTIMIZER FINAL CONTRACT: ${passed}/${total} passed`);
+if(passed!==total) process.exit(1);

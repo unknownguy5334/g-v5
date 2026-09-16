@@ -1,0 +1,45 @@
+import fs from 'node:fs';
+import path from 'node:path';
+
+const root = process.cwd();
+const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
+const payment = read('server/services/paymentService.ts');
+const routes = read('server/paymentRoutes.ts');
+const schema = read('server/db/schema.ts');
+const migration = read('server/db/migrations/0015_payment_integrity.sql');
+const productMigration = read('server/db/migrations/0014_api_db_integrity.sql');
+const paymentMigration = read('server/db/migrations/0003_payment_logic_hardening.sql');
+const journal = JSON.parse(read('server/db/migrations/meta/_journal.json'));
+const checks = [];
+const ok = (name, condition) => checks.push([name, Boolean(condition)]);
+
+ok('Server derives payable amount from enabled DB product', /from\(products\)\.where\(and\(eq\(products\.id, data\.plan\), eq\(products\.enabled, 1\)\)\)/s.test(payment) && /const amount = product\.amount/.test(payment));
+ok('Client plan/payment method cannot set amount or currency', !/req\.body[^\n]*(amount|currency)/i.test(routes) && !/data\.(amount|currency)/i.test(payment));
+ok('Payment submission plan is allowlisted server-side', /SUPPORTED_PLANS\.has\(data\.plan\)/.test(payment));
+ok('Payment method is allowlisted server-side', /SUPPORTED_PAYMENT_METHODS\.has\(data\.paymentMethod\)/.test(payment));
+ok('Academic scope is server-derived', /const currentContext = await getCurrentAcademicContext\(\)/.test(payment) && /resolvePurchaseContext/.test(payment));
+ok('Client academicYear/term are not trusted', /studentId: user\.id,[\s\S]*academicYear: context\.academicYear,[\s\S]*term: context\.term/.test(routes));
+ok('Historical price is snapshotted', /productNameSnapshot/.test(payment) && /productVersion/.test(payment) && /payableAmount/.test(payment));
+ok('Payment idempotency is DB unique', /payment_client_request_unique/.test(migration) || /payment_client_request_unique/.test(productMigration) || /payment_client_request_unique/.test(paymentMigration));
+ok('Pending scope is DB unique', /payment_pending_scope_unique/.test(migration) || /payment_pending_scope_unique/.test(productMigration) || /payment_pending_scope_unique/.test(paymentMigration));
+ok('Only ACTIVE entitlements grant access', /eq\(entitlements\.status, 'ACTIVE'\)/.test(read('server/services/accessService.ts')));
+ok('Active entitlement scope is unique', /entitlements_active_scope_unique/.test(productMigration) && /WHERE "status" = 'ACTIVE'/.test(productMigration));
+ok('Revoked entitlement does not block repurchase', /DROP INDEX IF EXISTS "entitlement_unique_scope"/.test(productMigration));
+ok('Approval requires a valid proof linked to the submission', /LEFT JOIN payment_proofs pp ON pp\.id = ps\.proof_id AND pp\.submission_id = ps\.id/.test(payment) && /A valid payment proof is required before approval\./.test(payment));
+ok('Proof MIME is closed to image-only formats', /payment_proofs_mime_type_chk/.test(migration) && /image\/png.*image\/jpeg.*image\/webp/s.test(migration));
+ok('Proof pointer is cross-table bound', /payment_submissions_proof_submission_fk/.test(migration) && /columns: \[table\.proofId, table\.id\]/.test(schema));
+ok('Payment proof foreign key cannot be detached from its submission', /REFERENCES "public"\."payment_proofs" \("id","submission_id"\);/.test(migration));
+ok('Submission amount has an upper bound', /payment_submissions_amount_max_chk/.test(migration) && /"amount" > 0 AND "amount" <= 100000/.test(migration));
+ok('Product version increments atomically', /onConflictDoUpdate\(\{ target: products\.id,[\s\S]*version: sql`\$\{products\.version\} \+ 1`/.test(routes));
+ok('Service layer validates payment proof independently of HTTP route', /validatePaymentProof\(data\.proofData, data\.proofMimeType\)/.test(payment));
+ok('Manual payment model has no webhook trust path', !/webhook/i.test(routes) && !/webhook/i.test(payment));
+ok('No refund endpoint exists', !/refund/i.test(routes));
+ok('Student payment cancellation is ownership-scoped', /WHERE id=\$1 AND student_id=\$2 AND payment_status='PENDING'/.test(payment));
+ok('Student payment reads are ownership-scoped', /where\(eq\(paymentSubmissions\.studentId, studentId\)\)/.test(payment));
+ok('Admin approval/rejection are admin-guarded', /\/api\/admin\/payments\/:id\/approve', requireAdmin/.test(routes) && /\/api\/admin\/payments\/:id\/reject', requireAdmin/.test(routes));
+ok('Migration journal includes 0015 payment integrity', journal.entries.some((e) => e?.tag === '0015_payment_integrity' && e?.idx === 15) && journal.entries.at(-1)?.tag === '0016_business_logic_integrity' && journal.entries.at(-1)?.idx === 16);
+
+const failed = checks.filter(([, pass]) => !pass);
+for (const [name, pass] of checks) console.log(`${pass ? 'PASS' : 'FAIL'} — ${name}`);
+if (failed.length) process.exit(1);
+console.log(`Payment Domain 28 gate: ${checks.length}/${checks.length} passed`);

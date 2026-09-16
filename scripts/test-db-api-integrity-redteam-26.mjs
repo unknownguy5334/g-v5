@@ -1,0 +1,44 @@
+import fs from 'node:fs';
+import path from 'node:path';
+const root = process.cwd();
+const read = (p) => fs.readFileSync(path.join(root, p), 'utf8');
+let passed = 0, failed = 0;
+function ok(name, condition){ if(condition){ console.log(`PASS ${name}`); passed++; } else { console.error(`FAIL ${name}`); failed++; }}
+const payment = read('server/services/paymentService.ts');
+const schedule = read('server/services/scheduleService.ts');
+const schema = read('server/db/schema.ts');
+const migration = read('server/db/migrations/0014_api_db_integrity.sql');
+const student = read('server/services/studentProfile.ts');
+const account = read('server/services/accountService.ts');
+const course = read('server/services/courseService.ts');
+
+ok('Payment approval checks ACTIVE entitlements only', /SELECT id FROM entitlements[\s\S]*status='ACTIVE' FOR UPDATE/.test(payment));
+ok('Legacy unconditional entitlement index is removed', /DROP INDEX IF EXISTS ["']?entitlement_unique_scope["']?/.test(migration));
+ok('ACTIVE entitlement scope remains uniquely constrained', /CREATE UNIQUE INDEX IF NOT EXISTS ["']entitlements_active_scope_unique["']/.test(migration) && /WHERE "status" = 'ACTIVE'/.test(migration));
+ok('Course revision parent/student integrity is DB-enforced', /course_set_revisions_course_set_student_fk/.test(migration));
+ok('Course revision schema declares composite foreign key', /foreignKey\(\{[\s\S]*columns: \[table\.courseSetId, table\.studentId\][\s\S]*foreignColumns: \[savedCourses\.id, savedCourses\.studentId\]/.test(schema));
+ok('Favorite mutation uses a transaction', /return db\.transaction\(async \(tx\)/.test(schedule));
+ok('Favorite update is student-scoped', /eq\(savedSchedules\.studentId, studentId\)/.test(schedule));
+ok('Favorite uniqueness is DB-enforced', /saved_schedules_one_favorite_per_student/.test(migration));
+ok('Existing duplicate favorites are normalized before uniqueness', /ROW_NUMBER\(\) OVER \(PARTITION BY student_id/.test(migration));
+ok('Schedule state mutations remain ownership-scoped', /eq\(savedSchedules\.id, scheduleId\), eq\(savedSchedules\.studentId, studentId\)/.test(schedule));
+ok('Schedule rename remains ownership-scoped', /savedSchedules\.id, scheduleId\)[\s\S]*savedSchedules\.studentId, studentId\)/.test(schedule));
+ok('Schedule delete remains ownership-scoped', /db\.delete\(savedSchedules\)\.where\(and\(eq\(savedSchedules\.id, scheduleId\), eq\(savedSchedules\.studentId, studentId\)\)\)/.test(schedule));
+ok('Course restore update remains ownership-scoped', /where\(and\(eq\(savedCourses\.id, courseSetId\), eq\(savedCourses\.studentId, studentId\)\)\)/.test(course));
+ok('Duplicate source lookup is ownership-scoped', /eq\(savedCourses\.id, sourceId\), eq\(savedCourses\.studentId, studentId\)/.test(account));
+ok('Duplicate target update is on a known student-owned target', /existingTarget\.id/.test(account) && /eq\(savedCourses\.id, existingTarget\.id\)/.test(account));
+ok('Student profile upsert cannot overwrite role', /role: 'STUDENT'/.test(student) && !/set:[\s\S]*role/.test(student));
+ok('Run completion remains ownership-scoped', /WHERE id=\$1 AND student_id=\$2 FOR UPDATE/.test(student));
+ok('Run completion checks saved schedule ownership', /WHERE run_id=\$1 AND student_id=\$2 LIMIT 1/.test(student));
+ok('Paid run checks active entitlement', /FROM entitlements WHERE student_id=\$1 AND status='ACTIVE'/.test(student));
+ok('Payment submission idempotency is DB-unique', /payment_client_request_unique/.test(read('server/db/migrations/0003_payment_logic_hardening.sql')));
+ok('Pending payment scope is DB-unique', /payment_pending_scope_unique/.test(read('server/db/migrations/0003_payment_logic_hardening.sql')));
+ok('Payment proof is one-per-submission DB-unique', /payment_proof_submission_unique/.test(read('server/db/migrations/0003_payment_logic_hardening.sql')));
+ok('Payment foreign keys cascade where child data must not orphan', /payment_proofs_submission_fk/.test(read('server/db/migrations/0008_exhaustive_integrity.sql')));
+ok('Saved course per-student-period uniqueness is DB-enforced', /saved_courses_student_context_unique/.test(read('server/db/migrations/0011_course_set_integrity.sql')));
+ok('Account deletion purge is batch-bounded', /LIMIT 100/.test(read('server/accountMaintenance.ts')));
+ok('Notification reads/writes remain student-scoped', /notifications\.studentId, studentId/.test(read('server/services/notificationService.ts')));
+ok('Admin payment review uses row locking', /SELECT ps\.\*,[\s\S]*WHERE ps\.id=\$1[\s\S]*FOR UPDATE/.test(payment));
+
+console.log(`DB/API integrity red-team: ${passed}/${passed+failed} checks passed`);
+process.exit(failed ? 1 : 0);

@@ -1,0 +1,20 @@
+import fs from 'node:fs';
+import path from 'node:path';
+const root = path.resolve(new URL('.', import.meta.url).pathname, '..');
+const optimizer = fs.readFileSync(path.join(root, 'server/optimizer/optimizer.ts'), 'utf8');
+const course = fs.readFileSync(path.join(root, 'src/utils/courseUtils.ts'), 'utf8');
+const panel = fs.readFileSync(path.join(root, 'src/components/SchedulePreferencesPanel.tsx'), 'utf8');
+const app = fs.readFileSync(path.join(root, 'src/App.tsx'), 'utf8');
+let passed=0,total=0;
+function ok(condition,label){total++;if(condition){passed++;console.log(`PASS: ${label}`)}else console.error(`FAIL: ${label}`)}
+ok(/targetCredits/.test(optimizer),'exact total-credit target remains supported');
+ok(/targetCourseCount/.test(optimizer),'exact total-course target remains supported');
+ok(/mandatoryCourseKeys/.test(optimizer),'mandatory-course selection remains supported');
+ok(/Math\.abs\(metrics\.totalCredits - targetCredits\) > EPSILON/.test(optimizer),'exact credit equality is enforced');
+ok(/chosen\.length !== targetCourseCount/.test(optimizer),'exact course-count equality is enforced');
+ok(!/dayBuckets|freeDays|earliestStartTime|latestEndTime|maxDays|preferCompactDays|useCreditRange|minCredits|maxCredits/.test(optimizer),'optimizer contains no removed preference system');
+ok(!/dayBuckets|freeDays|earliestStartTime|latestEndTime|maxDays|preferCompactDays|useCreditRange|minCredits|maxCredits/.test(panel),'preference panel contains no removed controls');
+ok(!/dayBuckets|freeDays|earliestStartTime|latestEndTime|maxDays|preferCompactDays|useCreditRange|minCredits|maxCredits/.test(app),'app contains no removed preference properties');
+ok(/computeInputsSignature/.test(course) && /mandatoryCourseKeys/.test(course),'input signatures track actual scheduling inputs');
+console.log(`CREDITS/MANDATORY SIMPLIFICATION AUDIT: ${passed}/${total} passed`);
+if(passed!==total) process.exit(1);
