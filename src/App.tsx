@@ -1,9 +1,9 @@
 /**
-import { devLogError, devLogWarn } from './utils/clientLogger';
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { devLogError, devLogWarn } from './utils/clientLogger';
 import React, { lazy, Suspense, useState, useEffect, useRef, useMemo, useReducer, useCallback } from 'react';
 import { AlertCircle, Compass, WifiOff, RefreshCw } from 'lucide-react';
 import { AppStep, OptimizerOutput, SchedulePreferences, Section } from './types';
@@ -626,26 +626,6 @@ export default function App() {
     setAuthModalView(view);
   }, []);
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    const params = new URLSearchParams(window.location.search);
-    const hashPart = window.location.hash.includes('?') ? window.location.hash.split('?')[1] : '';
-    const hashParams = new URLSearchParams(hashPart);
-    const resetToken = params.get('token') || params.get('resetToken') || hashParams.get('token') || hashParams.get('resetToken') || '';
-    const pathname = normalizePathname(window.location.pathname);
-
-    if (resetToken || pathname === '/reset-password') {
-      if (resetToken) {
-        setAuthResetToken(resetToken.slice(0, 2048));
-      }
-      setAuthModalView('forgot');
-      const cleanPath = pathname === '/reset-password' ? '/' : window.location.pathname;
-      const cleanHash = window.location.hash.includes('?') ? window.location.hash.split('?')[0] : window.location.hash;
-      const cleanUrl = `${cleanPath}${cleanHash}`;
-      window.history.replaceState({}, document.title, cleanUrl);
-    }
-  }, []);
-
   const closeInfoModal = useCallback((kind: InfoModal) => {
     const current = getInfoModalFromHash(window.location.hash.toLowerCase());
     if (current === kind || (kind === 'promise' && current === 'how-it-works')) {
@@ -1227,22 +1207,8 @@ export default function App() {
         onOpenDemo={(trigger) => openInfoModal('demo', trigger)}
         onOpenAuth={(view) => handleOpenAuth(view || 'login')}
         onOpenAccount={() => setIsAccountCenterOpen(true)}
+        accessState={accessState}
       />
-
-      <VerificationBanner onOpenVerify={() => handleOpenAuth('verify')} />
-      {user?.emailVerified && accessState && (
-        <div className="mx-auto max-w-7xl w-full px-4 sm:px-6 lg:px-8 pt-3" aria-live="polite">
-          <div className="inline-flex flex-wrap items-center gap-2 rounded-full border border-line bg-paper px-3 py-1.5 text-xs text-text-secondary">
-            <span className="font-semibold text-ink">Gadwal access:</span>
-            {accessState.hasAcademicYear ? <span className="font-bold text-emerald-700">Academic Year active</span> :
-             accessState.hasCurrentTerm ? <span className="font-bold text-emerald-700">Current Term active</span> :
-             accessState.hasFreeRun ? <span className="font-bold text-accent-strong">Free run available</span> :
-             <span className="font-bold text-text-secondary">Payment required</span>}
-            <span>•</span>
-            <span>{accessState.academicYear} · {accessState.term}</span>
-          </div>
-        </div>
-      )}
 
       {persistenceWarning && (
         <div role="status" aria-live="polite" className="mx-auto max-w-7xl w-full px-4 sm:px-6 lg:px-8 pt-3">
@@ -1474,6 +1440,7 @@ export default function App() {
         isOpen={authModalView !== null}
         initialView={authModalView || 'login'}
         initialResetToken={authResetToken}
+        onViewChange={setAuthModalView}
         onClose={() => { setAuthModalView(null); setAuthResetToken(''); }}
       />
 

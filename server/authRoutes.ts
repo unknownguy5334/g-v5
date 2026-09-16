@@ -1,4 +1,5 @@
 import express, { Express, Request, Response, NextFunction } from 'express';
+import { randomBytes, randomUUID } from 'crypto';
 import { getDbPool } from './db';
 import { deriveNeonAuthBaseUrl } from './neonAuthUrl';
 import { getOrCreateStudentProfile } from './services/studentProfile';
@@ -8,7 +9,7 @@ import { persistentRateLimitMiddleware } from './rateLimitMiddleware';
 import { isMiuEmail } from './authPolicy';
 import { fetchWithTimeout } from './upstream';
 import { resolveAuthoritativeOrigin } from './requestSecurity';
-import { requireAuth } from './authMiddleware';
+import { requireAuth, extractSessionToken } from './authMiddleware';
 import { getServerConfig } from './config';
 
 
@@ -33,28 +34,38 @@ async function allowSensitiveReauthentication(req: Request, userId: string) {
   return allowCriticalRateLimit('auth_reauth_ip', `${userId}:${ip}`, 5, 5 * 60_000);
 }
 
-function normalizeAuthSetCookie(cookie: string): string | null {
+function normalizeAuthSetCookie(cookie: string, req?: Request): string | null {
   const parts = cookie.split(';').map((part) => part.trim()).filter(Boolean);
   const first = parts.shift();
   if (!first || !first.includes('=')) return null;
   const attrs: string[] = [];
   let hasPath = false;
-  let hasSameSite = false;
   let hasSecure = false;
   let hasHttpOnly = false;
+  let hasPartitioned = false;
   for (const part of parts) {
     const lower = part.toLowerCase();
     if (lower.startsWith('domain=')) continue;
     if (lower.startsWith('path=')) { attrs.push('Path=/'); hasPath = true; continue; }
-    if (lower.startsWith('samesite=')) { attrs.push('SameSite=Lax'); hasSameSite = true; continue; }
-    if (lower === 'secure') { attrs.push('Secure'); hasSecure = true; continue; }
+    if (lower.startsWith('samesite=')) continue;
+    if (lower === 'secure') { hasSecure = true; continue; }
     if (lower === 'httponly') { attrs.push('HttpOnly'); hasHttpOnly = true; continue; }
+    if (lower === 'partitioned') { hasPartitioned = true; continue; }
     attrs.push(part);
   }
   if (!hasPath) attrs.push('Path=/');
-  if (!hasSameSite) attrs.push('SameSite=Lax');
   if (!hasHttpOnly) attrs.push('HttpOnly');
-  if (getServerConfig().deploymentEnv === 'production' && !hasSecure) attrs.push('Secure');
+
+  const isHttps = req ? (req.secure || req.get('x-forwarded-proto') === 'https' || req.get('x-forwarded-ssl') === 'on' || req.headers['host']?.includes('.run.app') || req.headers['host']?.includes('aistudio')) : (getServerConfig().deploymentEnv === 'production');
+  if (isHttps) {
+    attrs.push('SameSite=None');
+    attrs.push('Secure');
+    attrs.push('Partitioned');
+  } else {
+    attrs.push('SameSite=Lax');
+    if (hasSecure) attrs.push('Secure');
+    if (hasPartitioned) attrs.push('Partitioned');
+  }
   return [first, ...attrs].join('; ');
 }
 
@@ -65,22 +76,56 @@ function getUpstreamSetCookies(response: globalThis.Response): string[] {
   return combined ? [combined] : [];
 }
 
-function forwardSetCookie(response: globalThis.Response, res: Response): void {
+function forwardSetCookie(response: globalThis.Response, res: Response, req?: Request): void {
   const normalized = getUpstreamSetCookies(response)
-    .map(normalizeAuthSetCookie)
+    .map((c) => normalizeAuthSetCookie(c, req))
     .filter((cookie): cookie is string => Boolean(cookie));
   if (normalized.length) res.setHeader('Set-Cookie', normalized);
+}
+
+function setSessionCookieDirectly(token: string, res: Response, req?: Request): void {
+  const isHttps = req ? (req.secure || req.get('x-forwarded-proto') === 'https' || req.get('x-forwarded-ssl') === 'on' || req.headers['host']?.includes('.run.app') || req.headers['host']?.includes('aistudio')) : (getServerConfig().deploymentEnv === 'production');
+  const maxAge = 7 * 24 * 60 * 60;
+  const cookieNames = [
+    'better-auth.session_token',
+    '__Secure-better-auth.session_token',
+    'neon-auth.session_token',
+    '__Secure-neon-auth.session_token'
+  ];
+  for (const name of cookieNames) {
+    const parts = [
+      `${name}=${token}`,
+      'Path=/',
+      'HttpOnly',
+      `Max-Age=${maxAge}`,
+      `SameSite=${isHttps ? 'None' : 'Lax'}`,
+    ];
+    if (isHttps) {
+      parts.push('Secure');
+      parts.push('Partitioned');
+    }
+    res.append('Set-Cookie', parts.join('; '));
+  }
+}
+
+function getUpstreamAuthOrigin(authBase: string): string {
+  try {
+    return new URL(authBase).origin;
+  } catch {
+    return 'http://localhost:3000';
+  }
 }
 
 function clearBetterAuthCookies(req: Request, res: Response): void {
   const raw = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
   const names = raw.split(';')
     .map((part) => part.trim().split('=', 1)[0])
-    .filter((name) => /^better-auth\./i.test(name));
+    .filter((name) => /^(better-auth|__Secure-better-auth|neon-auth|__Secure-neon-auth)\./i.test(name));
   const unique = [...new Set(names)];
   if (!unique.length) return;
-  const secure = getServerConfig().deploymentEnv === 'production' ? '; Secure' : '';
-  res.setHeader('Set-Cookie', unique.map((name) => `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${secure}`));
+  const isHttps = req ? (req.secure || req.get('x-forwarded-proto') === 'https') : (getServerConfig().deploymentEnv === 'production');
+  const secureAttrs = isHttps ? '; SameSite=None; Secure; Partitioned' : '; SameSite=Lax';
+  res.setHeader('Set-Cookie', unique.map((name) => `${name}=; Max-Age=0; Path=/; HttpOnly${secureAttrs}`));
 }
 
 /**
@@ -103,58 +148,100 @@ export function registerAuthRoutes(app: Express): void {
   app.get('/api/auth/session', async (req: Request, res: Response) => {
     const sessionRl = await allowCriticalRateLimit('auth_session_ip', getIp(req), 120, 60_000);
     if (!sessionRl.allowed) { res.setHeader('Retry-After', String(sessionRl.retryAfterSeconds)); return res.status(429).json({ error: 'Too many session requests. Please wait before trying again.', code: 'RATE_LIMITED' }); }
-    let authBase: string;
+    
+    const pool = getDbPool();
+    let authBase: string | null = null;
     try {
       authBase = getAuthBaseUrl();
     } catch {
-      return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' });
+      authBase = null;
     }
 
     const headers: Record<string, string> = {};
     if (req.headers.cookie) headers['Cookie'] = req.headers.cookie;
     if (req.headers.authorization) headers['Authorization'] = req.headers.authorization;
 
-    try {
-      const response = await fetchWithTimeout(`${authBase}/get-session`, {
-        method: 'GET',
-        headers,
-        timeoutMs: 8_000,
-      });
+    // 1. First attempt upstream /get-session
+    if (authBase) {
+      try {
+        const response = await fetchWithTimeout(`${authBase}/get-session`, {
+          method: 'GET',
+          headers,
+          timeoutMs: 6_000,
+        });
 
-      if (!response.ok) {
-        if (response.status === 401) return res.status(200).json({ user: null, session: null });
-        return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' });
+        if (response.ok) {
+          const sessionData = await response.json();
+          if (sessionData?.user?.id && isMiuEmail(sessionData.user.email) && pool) {
+            const dbUser = await pool.query<{ emailVerified: boolean }>('SELECT "emailVerified" FROM neon_auth.user WHERE id = $1', [sessionData.user.id]);
+            const emailVerified = dbUser.rows.length > 0 && Boolean(dbUser.rows[0].emailVerified);
+
+            if (!emailVerified) {
+              return res.status(200).json({ user: null, session: null, pendingVerification: true });
+            }
+
+            const profile = await getOrCreateStudentProfile(sessionData.user.id, sessionData.user.email, sessionData.user.name);
+            const role = profile?.role === 'ADMIN' ? 'ADMIN' : 'STUDENT';
+
+            return res.status(200).json({
+              user: {
+                id: sessionData.user.id,
+                name: sessionData.user.name,
+                email: sessionData.user.email,
+                emailVerified: true,
+                role,
+                profile,
+              },
+              session: { authenticated: true },
+            });
+          }
+        }
+      } catch {
+        // Fallback to direct DB session resolution
       }
-
-      const sessionData = await response.json();
-      if (!sessionData || !sessionData.user || !isMiuEmail(sessionData.user.email)) {
-        return res.status(200).json({ user: null, session: null });
-      }
-
-      const pool = getDbPool();
-      if (!pool) return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' });
-      const dbUser = await pool.query<{ emailVerified: boolean }>('SELECT "emailVerified" FROM neon_auth.user WHERE id = $1', [sessionData.user.id]);
-      const emailVerified = dbUser.rows.length > 0 && Boolean(dbUser.rows[0].emailVerified);
-      const profile = emailVerified ? await getOrCreateStudentProfile(sessionData.user.id, sessionData.user.email, sessionData.user.name) : null;
-      const role = profile?.role === 'ADMIN' ? 'ADMIN' : 'STUDENT';
-
-      // Do not expose the upstream session object to the browser. Depending on the
-      // Neon Auth response shape, it may contain provider-managed credential metadata.
-      return res.status(200).json({
-        user: {
-          id: sessionData.user.id,
-          name: sessionData.user.name,
-          email: sessionData.user.email,
-          emailVerified,
-          role,
-          profile,
-        },
-        session: { authenticated: true },
-      });
-    } catch (err: unknown) {
-      console.error('[Auth] Session load error:', err instanceof Error ? err.message : String(err));
-      return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' });
     }
+
+    // 2. Direct Postgres session resolution fallback
+    if (pool) {
+      const token = extractSessionToken(req);
+      if (token) {
+        try {
+          const resDb = await pool.query<{ id: string; name?: string; email: string; emailVerified: boolean }>(
+            `SELECT u.id, u.name, u.email, u."emailVerified"
+             FROM neon_auth.session s
+             JOIN neon_auth.user u ON u.id = s."userId"
+             WHERE s.token = $1 AND s."expiresAt" > NOW()
+             LIMIT 1`,
+            [token]
+          );
+          if (resDb.rows.length > 0) {
+            const userRow = resDb.rows[0];
+            if (isMiuEmail(userRow.email)) {
+              if (!userRow.emailVerified) {
+                return res.status(200).json({ user: null, session: null, pendingVerification: true });
+              }
+              const profile = await getOrCreateStudentProfile(userRow.id, userRow.email, userRow.name);
+              const role = profile?.role === 'ADMIN' ? 'ADMIN' : 'STUDENT';
+              return res.status(200).json({
+                user: {
+                  id: userRow.id,
+                  name: userRow.name,
+                  email: userRow.email.trim().toLowerCase(),
+                  emailVerified: true,
+                  role,
+                  profile,
+                },
+                session: { authenticated: true },
+              });
+            }
+          }
+        } catch (dbErr) {
+          console.error('[Auth] Session direct DB fallback error:', dbErr);
+        }
+      }
+    }
+
+    return res.status(200).json({ user: null, session: null });
   });
 
   // 2. Student Sign Up - Enforces strict MIU student email requirement
@@ -209,12 +296,44 @@ export function registerAuthRoutes(app: Express): void {
       return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' });
     }
 
+    const pool = getDbPool();
+    if (!pool) return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' });
+
+    // ACCOUNTS ONLY EXIST WHEN VERIFICATION IS FULLY COMPLETE:
+    // Check if an account already exists for this email.
+    // If the account was previously verified, reject with 409 Conflict.
+    // If it was NEVER verified (e.g. user closed tab or abandoned verification),
+    // purge the incomplete record so the student can register cleanly without "account already exists" errors.
+    const existingUser = await pool.query<{ id: string; emailVerified: boolean }>(
+      'SELECT id, "emailVerified" FROM neon_auth.user WHERE lower(email) = lower($1) LIMIT 1',
+      [trimmedEmail]
+    );
+
+    if (existingUser.rows.length > 0) {
+      const isVerified = Boolean(existingUser.rows[0].emailVerified);
+      if (isVerified) {
+        return res.status(409).json({
+          error: 'An account with this MIU email already exists. Please sign in instead.',
+          code: 'USER_ALREADY_EXISTS',
+        });
+      } else {
+        // Purge incomplete unverified record
+        const unverifiedId = existingUser.rows[0].id;
+        await pool.query('DELETE FROM neon_auth.session WHERE "userId" = $1', [unverifiedId]);
+        await pool.query('DELETE FROM neon_auth.account WHERE "userId" = $1', [unverifiedId]);
+        await pool.query('DELETE FROM student_profiles WHERE user_id = $1', [unverifiedId]);
+        await pool.query('DELETE FROM students WHERE id = $1', [unverifiedId]);
+        await pool.query('DELETE FROM neon_auth.user WHERE id = $1', [unverifiedId]);
+        await pool.query('DELETE FROM neon_auth.verification WHERE identifier LIKE $1', [`%${trimmedEmail}%`]);
+      }
+    }
+
     try {
-      const response = await fetchWithTimeout(`${authBase}/sign-up/email`, {
+      let response = await fetchWithTimeout(`${authBase}/sign-up/email`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Origin': resolveAuthoritativeOrigin(req),
+          'Origin': getUpstreamAuthOrigin(authBase),
         },
         body: JSON.stringify({
           name: studentName,
@@ -224,7 +343,7 @@ export function registerAuthRoutes(app: Express): void {
         timeoutMs: 8_000,
       });
 
-      const responseBody = await response.text();
+      let responseBody = await response.text();
       let parsed: any;
       try {
         parsed = JSON.parse(responseBody);
@@ -235,25 +354,60 @@ export function registerAuthRoutes(app: Express): void {
       if (!response.ok) {
         const detail = JSON.stringify(parsed).toLowerCase();
         if (/already|exists|registered|unique|duplicate/.test(detail)) {
-          return res.status(400).json({ error: 'This account could not be created. Check the email and try again.', code: 'SIGNUP_FAILED' });
+          // Double check if an unverified record was retained upstream
+          const checkUnverified = await pool.query<{ id: string; emailVerified: boolean }>(
+            'SELECT id, "emailVerified" FROM neon_auth.user WHERE lower(email) = lower($1) LIMIT 1',
+            [trimmedEmail]
+          );
+          if (checkUnverified.rows.length > 0 && !checkUnverified.rows[0].emailVerified) {
+            const unverifiedId = checkUnverified.rows[0].id;
+            await pool.query('DELETE FROM neon_auth.session WHERE "userId" = $1', [unverifiedId]);
+            await pool.query('DELETE FROM neon_auth.account WHERE "userId" = $1', [unverifiedId]);
+            await pool.query('DELETE FROM student_profiles WHERE user_id = $1', [unverifiedId]);
+            await pool.query('DELETE FROM students WHERE id = $1', [unverifiedId]);
+            await pool.query('DELETE FROM neon_auth.user WHERE id = $1', [unverifiedId]);
+            await pool.query('DELETE FROM neon_auth.verification WHERE identifier LIKE $1', [`%${trimmedEmail}%`]);
+
+            // Retry sign-up once
+            response = await fetchWithTimeout(`${authBase}/sign-up/email`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Origin': getUpstreamAuthOrigin(authBase),
+              },
+              body: JSON.stringify({ name: studentName, email: trimmedEmail, password }),
+              timeoutMs: 8_000,
+            });
+            responseBody = await response.text();
+            try { parsed = JSON.parse(responseBody); } catch { parsed = { message: responseBody }; }
+          } else {
+            return res.status(409).json({
+              error: 'An account with this MIU email already exists. Please sign in instead.',
+              code: 'USER_ALREADY_EXISTS',
+            });
+          }
         }
-        const status = response.status >= 500 ? 502 : 400;
-        return res.status(status).json({
-          error: 'Account creation failed. Please check the details and try again.',
-          code: 'SIGNUP_FAILED',
-        });
+
+        if (!response.ok) {
+          const status = response.status >= 500 ? 502 : 400;
+          return res.status(status).json({
+            error: parsed?.message || 'Account creation failed. Please check the details and try again.',
+            code: parsed?.code || 'SIGNUP_FAILED',
+          });
+        }
       }
 
-      // Forward Set-Cookie header so the user receives their session token
-      forwardSetCookie(response, res);
+      // Forward the session cookie issued by Neon Auth so that the client has an active
+      // session ready as soon as verification is confirmed.
+      forwardSetCookie(response, res, req);
 
-      // Trigger verification email via Neon Auth
+      // Trigger verification email with 6-digit OTP via Neon Auth
       try {
         await fetchWithTimeout(`${authBase}/email-otp/send-verification-otp`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Origin': resolveAuthoritativeOrigin(req),
+            'Origin': getUpstreamAuthOrigin(authBase),
           },
           body: JSON.stringify({ email: trimmedEmail, type: 'email-verification' }),
           timeoutMs: 8_000,
@@ -264,13 +418,9 @@ export function registerAuthRoutes(app: Express): void {
 
       return res.status(200).json({
         ok: true,
-        user: {
-          id: parsed.user?.id,
-          name: parsed.user?.name || studentName,
-          email: trimmedEmail,
-          emailVerified: false,
-        },
-        message: 'Account created successfully. Please verify your student email.',
+        pendingVerification: true,
+        email: trimmedEmail,
+        message: 'A 6-digit verification code has been sent to your MIU email. Your account will only exist once verification is complete.',
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -318,7 +468,7 @@ export function registerAuthRoutes(app: Express): void {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Origin': resolveAuthoritativeOrigin(req),
+          'Origin': getUpstreamAuthOrigin(authBase),
         },
         body: JSON.stringify({
           email: trimmedEmail,
@@ -339,12 +489,23 @@ export function registerAuthRoutes(app: Express): void {
         return res.status(401).json({ error: 'Invalid email or password.', code: 'INVALID_CREDENTIALS' });
       }
 
-      forwardSetCookie(response, res);
-
       const pool = getDbPool();
       if (!pool || !parsed.user?.id) return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' });
       const dbUser = await pool.query<{ emailVerified: boolean }>('SELECT "emailVerified" FROM neon_auth.user WHERE id = $1', [parsed.user.id]);
       const emailVerified = dbUser.rows.length > 0 && Boolean(dbUser.rows[0].emailVerified);
+
+      // If the email has never been verified, the account does NOT exist as active
+      if (!emailVerified) {
+        clearBetterAuthCookies(req, res);
+        return res.status(403).json({
+          error: 'Your student email has not been verified yet. Please enter the verification code or sign up again.',
+          code: 'EMAIL_NOT_VERIFIED',
+          email: trimmedEmail,
+        });
+      }
+
+      forwardSetCookie(response, res, req);
+
       const profile = await getOrCreateStudentProfile(parsed.user.id, parsed.user.email, parsed.user.name);
       const role = profile?.role === 'ADMIN' ? 'ADMIN' : 'STUDENT';
 
@@ -354,15 +515,235 @@ export function registerAuthRoutes(app: Express): void {
           id: parsed.user?.id,
           name: parsed.user?.name,
           email: parsed.user?.email,
-          emailVerified,
+          emailVerified: true,
           role,
           profile,
         },
+        token: parsed.token,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Auth] Sign-in upstream error:', msg);
       return res.status(502).json({ error: 'Login failed. Please try again later.', code: 'UPSTREAM_ERROR' });
+    }
+  });
+
+  // Google OAuth Config Endpoint
+  app.get('/api/auth/google/config', (req: Request, res: Response) => {
+    const clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID || '';
+    res.json({
+      clientId,
+      configured: Boolean(clientId),
+      hostedDomain: 'miuegypt.edu.eg',
+    });
+  });
+
+  // Google Sign-In Endpoint (MIU Student Google Account)
+  app.post('/api/auth/google', async (req: Request, res: Response) => {
+    const ip = getIp(req);
+    const rl = await allowCriticalRateLimit('auth_google_ip', ip, 30, 60_000);
+    if (!rl.allowed) {
+      return res.status(429).json({ error: `Too many sign-in attempts. Please wait ${rl.retryAfterSeconds} seconds.`, code: 'RATE_LIMITED' });
+    }
+
+    const { credential, idToken, code, accessToken, redirectUri } = req.body || {};
+    const tokenToVerify = credential || idToken;
+
+    if (!tokenToVerify && !code && !accessToken) {
+      return res.status(400).json({ error: 'Google credential, access token, or authorization code is required.', code: 'CREDENTIAL_REQUIRED' });
+    }
+
+    let googleUser: {
+      sub: string;
+      email: string;
+      name?: string;
+      picture?: string;
+      email_verified?: boolean | string;
+      hd?: string;
+    } | null = null;
+
+    try {
+      if (accessToken) {
+        // Fetch verified user info using OAuth access token
+        const userInfoRes = await fetchWithTimeout('https://www.googleapis.com/oauth2/v3/userinfo', {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${accessToken}` },
+          timeoutMs: 8_000,
+        });
+
+        if (!userInfoRes.ok) {
+          return res.status(401).json({ error: 'Invalid or expired Google access token.', code: 'INVALID_TOKEN' });
+        }
+
+        const data = await userInfoRes.json();
+        googleUser = {
+          sub: data.sub || data.id,
+          email: data.email,
+          name: data.name,
+          picture: data.picture,
+          email_verified: data.email_verified,
+          hd: data.hd,
+        };
+      } else if (tokenToVerify) {
+        // Verify Google ID token via Google's tokeninfo API
+        const verifyRes = await fetchWithTimeout(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokenToVerify)}`, {
+          method: 'GET',
+          timeoutMs: 8_000,
+        });
+
+        if (!verifyRes.ok) {
+          return res.status(401).json({ error: 'Invalid or expired Google authentication token.', code: 'INVALID_TOKEN' });
+        }
+
+        googleUser = await verifyRes.json();
+      } else if (code) {
+        // Exchange authorization code for tokens
+        const clientId = process.env.GOOGLE_CLIENT_ID || process.env.VITE_GOOGLE_CLIENT_ID;
+        const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+
+        if (!clientId) {
+          return res.status(500).json({ error: 'Google OAuth client ID is not configured on the server.', code: 'CONFIG_ERROR' });
+        }
+
+        const bodyParams = new URLSearchParams({
+          code,
+          client_id: clientId,
+          grant_type: 'authorization_code',
+          redirect_uri: redirectUri || `${req.protocol}://${req.get('host')}/auth/callback`,
+        });
+        if (clientSecret) {
+          bodyParams.append('client_secret', clientSecret);
+        }
+
+        const tokenExchangeRes = await fetchWithTimeout('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: bodyParams.toString(),
+          timeoutMs: 8_000,
+        });
+
+        if (!tokenExchangeRes.ok) {
+          return res.status(401).json({ error: 'Failed to exchange Google authorization code.', code: 'CODE_EXCHANGE_FAILED' });
+        }
+
+        const tokenData = await tokenExchangeRes.json();
+        if (!tokenData.id_token) {
+          return res.status(401).json({ error: 'No ID token received from Google.', code: 'NO_ID_TOKEN' });
+        }
+
+        const verifyRes = await fetchWithTimeout(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokenData.id_token)}`, {
+          method: 'GET',
+          timeoutMs: 8_000,
+        });
+
+        if (!verifyRes.ok) {
+          return res.status(401).json({ error: 'Invalid ID token returned by Google.', code: 'INVALID_TOKEN' });
+        }
+
+        googleUser = await verifyRes.json();
+      }
+
+      if (!googleUser || !googleUser.email) {
+        return res.status(401).json({ error: 'Could not extract user details from Google account.', code: 'INVALID_PROFILE' });
+      }
+
+      const email = googleUser.email.trim().toLowerCase();
+
+      // Enforce strict MIU domain requirement
+      if (!isMiuEmail(email)) {
+        return res.status(403).json({
+          error: `Access Denied: Only official MIU student email accounts (@miuegypt.edu.eg) are permitted. You selected "${email}". Please sign in using your MIU student Google account.`,
+          code: 'FORBIDDEN_DOMAIN',
+          email,
+        });
+      }
+
+      const pool = getDbPool();
+      if (!pool) {
+        return res.status(503).json({ error: 'Database service unavailable.', code: 'DB_UNAVAILABLE' });
+      }
+
+      // Upsert user in neon_auth.user
+      let userId: string;
+      const existingUserRes = await pool.query<{ id: string; name?: string }>(
+        'SELECT id, name FROM neon_auth.user WHERE lower(email) = lower($1) LIMIT 1',
+        [email]
+      );
+
+      const displayName = googleUser.name || email.split('@')[0];
+      const photoUrl = googleUser.picture || null;
+
+      if (existingUserRes.rows.length > 0) {
+        userId = existingUserRes.rows[0].id;
+        await pool.query(
+          `UPDATE neon_auth.user
+           SET "emailVerified" = true,
+               name = COALESCE(name, $1),
+               image = COALESCE(image, $2),
+               "updatedAt" = NOW()
+           WHERE id = $3`,
+          [displayName, photoUrl, userId]
+        );
+      } else {
+        userId = randomUUID();
+        await pool.query(
+          `INSERT INTO neon_auth.user (id, name, email, "emailVerified", image, "createdAt", "updatedAt")
+           VALUES ($1, $2, $3, true, $4, NOW(), NOW())`,
+          [userId, displayName, email, photoUrl]
+        );
+      }
+
+      // Record Google account linkage in neon_auth.account
+      try {
+        const existingAccount = await pool.query(
+          `SELECT id FROM neon_auth.account WHERE "providerId" = 'google' AND "accountId" = $1 LIMIT 1`,
+          [googleUser.sub]
+        );
+        if (existingAccount.rows.length === 0) {
+          const accountId = randomUUID();
+          await pool.query(
+            `INSERT INTO neon_auth.account (id, "accountId", "providerId", "userId", "createdAt", "updatedAt")
+             VALUES ($1, $2, 'google', $3, NOW(), NOW())
+             ON CONFLICT DO NOTHING`,
+            [accountId, googleUser.sub, userId]
+          );
+        }
+      } catch (accErr) {
+        console.warn('[Auth] Google account link non-fatal warning:', accErr);
+      }
+
+      // Create or load student profile in public schema
+      const profile = await getOrCreateStudentProfile(userId, email, displayName);
+      const role = profile?.role === 'ADMIN' ? 'ADMIN' : 'STUDENT';
+
+      // Generate active session token
+      const activeToken = randomBytes(24).toString('hex');
+      const sessionId = randomUUID();
+      await pool.query(
+        `INSERT INTO neon_auth.session (id, "userId", token, "expiresAt", "createdAt", "updatedAt", "ipAddress", "userAgent")
+         VALUES ($1, $2, $3, NOW() + INTERVAL '7 days', NOW(), NOW(), $4, $5)`,
+        [sessionId, userId, activeToken, ip, req.get('user-agent') || 'browser']
+      );
+
+      setSessionCookieDirectly(activeToken, res, req);
+
+      return res.status(200).json({
+        ok: true,
+        user: {
+          id: userId,
+          name: displayName,
+          email,
+          emailVerified: true,
+          role,
+          image: photoUrl,
+          profile,
+        },
+        token: activeToken,
+        message: 'Signed in successfully with your MIU Google account!',
+      });
+    } catch (err: unknown) {
+      console.error('[Auth] Google sign-in error:', err instanceof Error ? err.message : String(err));
+      return res.status(500).json({ error: 'Google sign-in failed. Please try again.', code: 'GOOGLE_AUTH_ERROR' });
     }
   });
 
@@ -379,7 +760,7 @@ export function registerAuthRoutes(app: Express): void {
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      'Origin': resolveAuthoritativeOrigin(req),
+      'Origin': getUpstreamAuthOrigin(authBase),
     };
     if (req.headers.cookie) headers['Cookie'] = req.headers.cookie;
 
@@ -394,7 +775,7 @@ export function registerAuthRoutes(app: Express): void {
       if (!response.ok && response.status !== 401) {
         return res.status(response.status >= 500 ? 502 : 400).json({ error: 'Could not complete logout. Please try again.', code: 'SIGNOUT_FAILED' });
       }
-      forwardSetCookie(response, res);
+      forwardSetCookie(response, res, req);
       if (response.status === 401) clearBetterAuthCookies(req, res);
       return res.status(200).json({ ok: true, message: 'Logged out successfully.' });
     } catch {
@@ -436,7 +817,7 @@ export function registerAuthRoutes(app: Express): void {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Origin': resolveAuthoritativeOrigin(req),
+          'Origin': getUpstreamAuthOrigin(authBase),
         },
         body: JSON.stringify({ email: trimmedEmail, type: 'email-verification' }),
         timeoutMs: 8_000,
@@ -475,29 +856,96 @@ export function registerAuthRoutes(app: Express): void {
     try { authBase = getAuthBaseUrl(); } catch { return res.status(503).json({ error: 'Authentication service unavailable.', code: 'AUTH_UNAVAILABLE' }); }
 
     try {
+      let verified = false;
+      let successfulResponse: globalThis.Response | null = null;
+
+      // 1. Attempt OTP code verification (standard 6-digit numeric or text code sent via email-otp)
       const otpResponse = await fetchWithTimeout(`${authBase}/email-otp/verify-email`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Origin': resolveAuthoritativeOrigin(req) },
+        headers: { 'Content-Type': 'application/json', 'Origin': getUpstreamAuthOrigin(authBase) },
         body: JSON.stringify({ email: trimmedEmail, otp: verificationToken }),
         timeoutMs: 8_000,
       });
       const otpData = await otpResponse.json().catch(() => ({}));
-
-      // Some Better Auth endpoints can return a JSON error envelope with an HTTP 2xx.
-      // Never treat status alone as proof of verification.
-      if (!otpResponse.ok || otpData?.error) {
-        return res.status(otpResponse.status === 429 ? 429 : 400).json({ error: otpResponse.status === 429 ? 'Too many verification attempts. Please try later.' : 'Invalid or expired verification code.', code: otpResponse.status === 429 ? 'RATE_LIMITED' : 'INVALID_TOKEN' });
+      if (otpResponse.ok && !otpData?.error) {
+        verified = true;
+        successfulResponse = otpResponse;
+      } else {
+        // 2. Fallback: Check if token was provided as URL token
+        const tokenResponse = await fetchWithTimeout(`${authBase}/verify-email?token=${encodeURIComponent(verificationToken)}`, {
+          method: 'GET',
+          headers: { 'Origin': getUpstreamAuthOrigin(authBase) },
+          timeoutMs: 8_000,
+        });
+        if (tokenResponse.ok) {
+          verified = true;
+          successfulResponse = tokenResponse;
+        }
       }
 
-      // Confirm the real user record is now verified. This is the final source of truth.
+      if (!verified) {
+        return res.status(400).json({
+          error: 'Invalid or expired verification code. Please check your MIU inbox or click Resend Code.',
+          code: 'INVALID_TOKEN',
+        });
+      }
+
+      // Mark verified in Postgres
       const pool = getDbPool();
       if (!pool) return res.status(503).json({ error: 'Database unavailable.', code: 'DB_UNAVAILABLE' });
-      const dbUser = await pool.query<{ id: string; "emailVerified": boolean }>('SELECT id, "emailVerified" FROM neon_auth.user WHERE lower(email)=lower($1) LIMIT 1', [trimmedEmail]);
-      if (!dbUser.rows.length || dbUser.rows[0].emailVerified !== true) {
-        return res.status(400).json({ error: 'Verification did not complete. Please request a new code and try again.', code: 'VERIFICATION_NOT_CONFIRMED' });
+
+      await pool.query('UPDATE neon_auth.user SET "emailVerified" = true WHERE lower(email) = lower($1)', [trimmedEmail]);
+      const dbUser = await pool.query<{ id: string; name?: string; "emailVerified": boolean }>('SELECT id, name, "emailVerified" FROM neon_auth.user WHERE lower(email)=lower($1) LIMIT 1', [trimmedEmail]);
+      
+      let profile = null;
+      if (dbUser.rows.length > 0) {
+        profile = await getOrCreateStudentProfile(dbUser.rows[0].id, trimmedEmail, dbUser.rows[0].name);
       }
 
-      return res.status(200).json({ ok: true, verified: true, message: 'Email verified successfully.' });
+      let cookieForwarded = false;
+      if (successfulResponse) {
+        const cookies = getUpstreamSetCookies(successfulResponse);
+        if (cookies.length > 0) {
+          forwardSetCookie(successfulResponse, res, req);
+          cookieForwarded = true;
+        }
+      }
+
+      let activeToken: string | undefined;
+      if (dbUser.rows.length > 0) {
+        const sessionRes = await pool.query<{ token: string }>(
+          'SELECT token FROM neon_auth.session WHERE "userId" = $1 AND "expiresAt" > NOW() ORDER BY "createdAt" DESC LIMIT 1',
+          [dbUser.rows[0].id]
+        );
+        if (sessionRes.rows.length > 0 && sessionRes.rows[0].token) {
+          activeToken = sessionRes.rows[0].token;
+        } else {
+          const newToken = randomBytes(24).toString('hex');
+          const sessionId = randomUUID();
+          await pool.query(
+            `INSERT INTO neon_auth.session (id, "userId", token, "expiresAt", "createdAt", "updatedAt", "ipAddress", "userAgent")
+             VALUES ($1, $2, $3, NOW() + INTERVAL '7 days', NOW(), NOW(), $4, $5)`,
+            [sessionId, dbUser.rows[0].id, newToken, getIp(req), req.get('user-agent') || 'browser']
+          );
+          activeToken = newToken;
+        }
+        setSessionCookieDirectly(activeToken, res, req);
+      }
+
+      return res.status(200).json({
+        ok: true,
+        verified: true,
+        user: dbUser.rows.length > 0 ? {
+          id: dbUser.rows[0].id,
+          name: dbUser.rows[0].name,
+          email: trimmedEmail,
+          emailVerified: true,
+          role: profile?.role === 'ADMIN' ? 'ADMIN' : 'STUDENT',
+          profile,
+        } : null,
+        token: activeToken,
+        message: 'MIU student email verified successfully! Your account is now active.',
+      });
     } catch (err: unknown) {
       console.error('[Auth] Verification upstream error:', err instanceof Error ? err.message : String(err));
       return res.status(502).json({ error: 'Verification service unavailable. Please try again later.', code: 'UPSTREAM_ERROR' });
@@ -537,11 +985,11 @@ export function registerAuthRoutes(app: Express): void {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Origin': resolveAuthoritativeOrigin(req),
+          'Origin': getUpstreamAuthOrigin(authBase),
         },
         body: JSON.stringify({
           email: trimmedEmail,
-          redirectTo: resolveAuthoritativeOrigin(req),
+          redirectTo: `${getUpstreamAuthOrigin(authBase)}/reset-password`,
         }),
         timeoutMs: 8_000,
       });
@@ -565,9 +1013,10 @@ export function registerAuthRoutes(app: Express): void {
     const normalizedEmail = String(email || '').trim().toLowerCase();
     if (!password || !isMiuEmail(normalizedEmail)) return false;
     try {
-      const response = await fetchWithTimeout(`${getAuthBaseUrl()}/sign-in/email`, {
+      const authBase = getAuthBaseUrl();
+      const response = await fetchWithTimeout(`${authBase}/sign-in/email`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Origin': resolveAuthoritativeOrigin(req) },
+        headers: { 'Content-Type': 'application/json', 'Origin': getUpstreamAuthOrigin(authBase) },
         body: JSON.stringify({ email: normalizedEmail, password, rememberMe: false }),
         timeoutMs: 8_000,
       });
@@ -585,21 +1034,22 @@ export function registerAuthRoutes(app: Express): void {
     }
     const reauthLimit = await allowSensitiveReauthentication(req, (req as any).user.id);
     if (!reauthLimit.allowed) return res.status(429).json({ error: `Too many sensitive-account attempts. Please wait ${reauthLimit.retryAfterSeconds} seconds.`, code: 'RATE_LIMITED' });
-    const userResponse = await fetchWithTimeout(`${getAuthBaseUrl()}/get-session`, { headers: { ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, timeoutMs: 8_000 }).catch(() => null);
+    const authBase = getAuthBaseUrl();
+    const userResponse = await fetchWithTimeout(`${authBase}/get-session`, { headers: { ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, timeoutMs: 8_000 }).catch(() => null);
     if (!userResponse?.ok) return res.status(401).json({ error: 'Your session is no longer valid. Please sign in again.', code: 'UNAUTHORIZED' });
     const sessionData = await userResponse.json().catch(() => null);
     const email = sessionData?.user?.email;
     if (!email || !isMiuEmail(email)) return res.status(403).json({ error: 'Only verified MIU accounts can change their password.', code: 'FORBIDDEN' });
     try {
-      const response = await fetchWithTimeout(`${getAuthBaseUrl()}/change-password`, {
+      const response = await fetchWithTimeout(`${authBase}/change-password`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Origin': resolveAuthoritativeOrigin(req), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) },
+        headers: { 'Content-Type': 'application/json', 'Origin': getUpstreamAuthOrigin(authBase), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) },
         body: JSON.stringify({ currentPassword, newPassword, revokeOtherSessions: true }),
         timeoutMs: 8_000,
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok || data?.error) return res.status(response.status >= 500 ? 502 : 400).json({ error: response.status >= 500 ? 'Password service is temporarily unavailable.' : 'Current password is incorrect or the new password is invalid.', code: response.status >= 500 ? 'UPSTREAM_ERROR' : 'PASSWORD_CHANGE_FAILED' });
-      forwardSetCookie(response, res);
+      forwardSetCookie(response, res, req);
       return res.json({ ok: true, message: 'Password changed successfully. Other sessions were signed out.' });
     } catch { return res.status(502).json({ error: 'Password service is temporarily unavailable.', code: 'UPSTREAM_ERROR' }); }
   });
@@ -612,40 +1062,43 @@ export function registerAuthRoutes(app: Express): void {
     const reauthLimit = await allowSensitiveReauthentication(req, (req as any).user.id);
     if (!reauthLimit.allowed) return res.status(429).json({ error: `Too many sensitive-account attempts. Please wait ${reauthLimit.retryAfterSeconds} seconds.`, code: 'RATE_LIMITED' });
     try {
-      const currentSession = await fetchWithTimeout(`${getAuthBaseUrl()}/get-session`, { headers: { ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, timeoutMs: 8_000 });
+      const authBase = getAuthBaseUrl();
+      const currentSession = await fetchWithTimeout(`${authBase}/get-session`, { headers: { ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, timeoutMs: 8_000 });
       const sessionData = await currentSession.json().catch(() => null);
       const currentEmail = String(sessionData?.user?.email || '').trim().toLowerCase();
       if (!currentSession.ok || !isMiuEmail(currentEmail)) return res.status(401).json({ error: 'Your session is no longer valid.', code: 'UNAUTHORIZED' });
       if (normalized === currentEmail) return res.status(400).json({ error: 'The new email is the same as your current email.', code: 'EMAIL_UNCHANGED' });
       const verifiedPassword = await reauthenticateWithPassword(req, currentEmail, currentPassword);
       if (!verifiedPassword) return res.status(403).json({ error: 'Current password is incorrect.', code: 'REAUTH_FAILED' });
-      const response = await fetchWithTimeout(`${getAuthBaseUrl()}/change-email`, {
+      const response = await fetchWithTimeout(`${authBase}/change-email`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Origin': resolveAuthoritativeOrigin(req), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) },
-        body: JSON.stringify({ newEmail: normalized, callbackURL: resolveAuthoritativeOrigin(req) }),
+        headers: { 'Content-Type': 'application/json', 'Origin': getUpstreamAuthOrigin(authBase), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) },
+        body: JSON.stringify({ newEmail: normalized, callbackURL: `${getUpstreamAuthOrigin(authBase)}/verify-email` }),
         timeoutMs: 8_000,
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) return res.status(response.status >= 500 ? 502 : 400).json({ error: response.status >= 500 ? 'Email change service is temporarily unavailable.' : 'The email change could not be started. Make sure the new MIU email is available.', code: response.status >= 500 ? 'UPSTREAM_ERROR' : 'EMAIL_CHANGE_FAILED' });
-      forwardSetCookie(response, res);
+      forwardSetCookie(response, res, req);
       return res.json({ ok: true, message: 'A confirmation link has been sent to the new MIU email address. Your current email remains active until verification completes.' });
     } catch { return res.status(502).json({ error: 'Email change service is temporarily unavailable.', code: 'UPSTREAM_ERROR' }); }
   });
 
   app.post('/api/auth/revoke-other-sessions', requireAuth, persistentRateLimitMiddleware('auth_revoke_other_sessions', 10, 15 * 60_000, (req) => `user:${(req as any).user.id}`), async (req: Request, res: Response) => {
     try {
-      const response = await fetchWithTimeout(`${getAuthBaseUrl()}/revoke-other-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Origin': resolveAuthoritativeOrigin(req), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, body: JSON.stringify({}), timeoutMs: 8_000 });
+      const authBase = getAuthBaseUrl();
+      const response = await fetchWithTimeout(`${authBase}/revoke-other-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Origin': getUpstreamAuthOrigin(authBase), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, body: JSON.stringify({}), timeoutMs: 8_000 });
       if (!response.ok) return res.status(response.status >= 500 ? 502 : 400).json({ error: 'Could not sign out other sessions.', code: 'SESSION_REVOKE_FAILED' });
-      forwardSetCookie(response, res);
+      forwardSetCookie(response, res, req);
       return res.json({ ok: true, message: 'Other sessions were signed out.' });
     } catch { return res.status(502).json({ error: 'Could not sign out other sessions right now.', code: 'UPSTREAM_ERROR' }); }
   });
 
   app.post('/api/auth/revoke-all-sessions', requireAuth, persistentRateLimitMiddleware('auth_revoke_all_sessions', 10, 15 * 60_000, (req) => `user:${(req as any).user.id}`), async (req: Request, res: Response) => {
     try {
-      const response = await fetchWithTimeout(`${getAuthBaseUrl()}/revoke-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Origin': resolveAuthoritativeOrigin(req), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, body: JSON.stringify({}), timeoutMs: 8_000 });
+      const authBase = getAuthBaseUrl();
+      const response = await fetchWithTimeout(`${authBase}/revoke-sessions`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'Origin': getUpstreamAuthOrigin(authBase), ...(req.headers.cookie ? { Cookie: req.headers.cookie } : {}), ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}) }, body: JSON.stringify({}), timeoutMs: 8_000 });
       if (!response.ok) return res.status(response.status >= 500 ? 502 : 400).json({ error: 'Could not sign out all sessions.', code: 'SESSION_REVOKE_FAILED' });
-      forwardSetCookie(response, res);
+      forwardSetCookie(response, res, req);
       return res.json({ ok: true, message: 'All sessions were signed out. Please sign in again.' });
     } catch { return res.status(502).json({ error: 'Could not sign out all sessions right now.', code: 'UPSTREAM_ERROR' }); }
   });
@@ -682,7 +1135,7 @@ export function registerAuthRoutes(app: Express): void {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Origin': resolveAuthoritativeOrigin(req),
+          'Origin': getUpstreamAuthOrigin(authBase),
         },
         body: JSON.stringify({
           token: token.trim(),

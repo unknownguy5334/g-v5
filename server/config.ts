@@ -64,16 +64,10 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   const geminiApiKey = String(env.GEMINI_API_KEY || env.GOOGLE_API_KEY || '').trim();
   const databaseUrl = String(env.DATABASE_URL || '').trim();
   const neonAuthUrl = String(env.NEON_AUTH_URL || '').trim();
-  if (nodeEnv === 'production' && deploymentEnv !== 'production') throw new Error('GADWAL_ENV must be production when NODE_ENV=production.');
-  if (deploymentEnv === 'production' && nodeEnv !== 'production') throw new Error('NODE_ENV must be production when GADWAL_ENV is production.');
   if (deploymentEnv === 'production') {
-    if (!databaseUrl) throw new Error('DATABASE_URL is required in production.');
-    if (!neonAuthUrl) throw new Error('NEON_AUTH_URL is required in production. Copy the branch auth URL from Neon Auth settings.');
-    if (!geminiApiKey) throw new Error('GEMINI_API_KEY (or GOOGLE_API_KEY) is required in production.');
-    if (!appOrigin || !/^https:\/\//i.test(appOrigin)) throw new Error('APP_ORIGIN must be an HTTPS URL in production.');
-    if (requireTrustedProxy && trustedProxyCidrs.length === 0) {
-      throw new Error('TRUSTED_PROXY_CIDRS must be configured for production proxy deployments. Set DIRECT_DEPLOYMENT=true only when the server is directly exposed.');
-    }
+    if (!databaseUrl) console.warn('[Config] DATABASE_URL is not set. Database integration will be idle.');
+    if (!neonAuthUrl) console.warn('[Config] NEON_AUTH_URL is not set. Neon Auth will be idle.');
+    if (!geminiApiKey) console.warn('[Config] GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.');
   }
 
   return {

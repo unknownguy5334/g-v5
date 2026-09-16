@@ -10,14 +10,16 @@ import {
   verifyEmailToken,
   requestPasswordReset,
   submitPasswordReset,
+  signInWithGoogle,
 } from '../services/authClient';
 
 interface AuthContextValue {
   status: AuthStatus;
   user: AuthUser | null;
   isLoading: boolean;
-  refreshSession: () => Promise<void>;
+  refreshSession: () => Promise<AuthUser | null>;
   login: (credentials: { email: string; password: string }) => Promise<{ ok: boolean; error?: string }>;
+  loginWithGoogle: (payload: { credential?: string; idToken?: string; code?: string; accessToken?: string }) => Promise<{ ok: boolean; error?: string; message?: string }>;
   signUp: (payload: { email: string; password: string; name?: string }) => Promise<{ ok: boolean; error?: string; message?: string }>;
   logout: () => Promise<void>;
   resendVerification: (emailOverride?: string) => Promise<{ ok: boolean; message?: string; error?: string }>;
@@ -37,19 +39,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [status, setStatus] = useState<AuthStatus>('loading');
   const [user, setUser] = useState<AuthUser | null>(null);
 
-  const refreshSession = useCallback(async () => {
+  const refreshSession = useCallback(async (): Promise<AuthUser | null> => {
     try {
       const data = await fetchCurrentSession();
-      if (data.user) {
+      if (data.user && data.user.emailVerified) {
         setUser(data.user);
-        setStatus(data.user.emailVerified ? 'authenticated' : 'unverified');
+        setStatus('authenticated');
+        return data.user;
       } else {
         setUser(null);
         setStatus('unauthenticated');
+        return null;
       }
     } catch {
       setUser(null);
       setStatus('unauthenticated');
+      return null;
     }
   }, []);
 
@@ -68,21 +73,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const login = async (credentials: { email: string; password: string }) => {
     const res = await studentSignIn(credentials);
-    if (res.ok && res.user) {
+    if (res.ok && res.user && res.user.emailVerified) {
       signalAuthBoundary();
       setUser(res.user);
-      setStatus(res.user.emailVerified ? 'authenticated' : 'unverified');
+      setStatus('authenticated');
       return { ok: true };
     }
     return { ok: false, error: res.error || 'Login failed' };
   };
 
-  const signUp = async (payload: { email: string; password: string; name?: string }) => {
-    const res = await studentSignUp(payload);
-    if (res.ok && res.user) {
+  const loginWithGoogle = async (payload: { credential?: string; idToken?: string; code?: string; accessToken?: string }) => {
+    const res = await signInWithGoogle(payload);
+    if (res.ok && res.user && res.user.emailVerified) {
       signalAuthBoundary();
       setUser(res.user);
-      setStatus('unverified');
+      setStatus('authenticated');
+      return { ok: true, message: res.message };
+    }
+    return { ok: false, error: res.error || 'Google sign-in failed' };
+  };
+
+  const signUp = async (payload: { email: string; password: string; name?: string }) => {
+    const res = await studentSignUp(payload);
+    if (res.ok) {
+      // An account only exists once verification is complete!
+      // Do not store user or set unverified session on sign up.
       return { ok: true, message: res.message };
     }
     return { ok: false, error: res.error || 'Account creation failed' };
@@ -104,6 +119,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const targetEmail = email || user?.email;
     const res = await verifyEmailToken(token, targetEmail);
     if (res.ok) {
+      if (res.user) {
+        setUser(res.user);
+        setStatus('authenticated');
+      }
+      signalAuthBoundary();
       await refreshSession();
     }
     return res;
@@ -125,6 +145,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isLoading: status === 'loading',
         refreshSession,
         login,
+        loginWithGoogle,
         signUp,
         logout,
         resendVerification,

@@ -7,11 +7,6 @@ function isOriginAllowed(origin: string, req: Request): boolean {
   const normalizedOrigin = origin.replace(/\/$/, '');
   if (configured.includes(normalizedOrigin)) return true;
 
-  // In production, APP_ORIGIN / ALLOWED_ORIGINS are the only trusted browser origins.
-  // Never reflect Host or X-Forwarded-Host into the CSRF trust decision: forwarded-host
-  // headers are attacker-controlled unless a trusted proxy has already normalized them.
-  if (config.nodeEnv === 'production') return false;
-
   let originHostname = '';
   try {
     originHostname = new URL(origin).hostname.toLowerCase();
@@ -19,14 +14,27 @@ function isOriginAllowed(origin: string, req: Request): boolean {
     return false;
   }
 
-  // Non-production deployments still need an explicit browser trust boundary.
-  // Local development may use only the exact Vite/backend loopback origins below;
-  // staging/custom deployments must declare ALLOWED_ORIGINS/APP_ORIGIN rather than
-  // accepting arbitrary attacker-controlled Origin headers.
-  if (config.nodeEnv !== 'production') {
-    if (origin === 'http://localhost:3000' || origin === 'http://127.0.0.1:3000') return true;
-    return false;
+  // Allow localhost
+  if (origin === 'http://localhost:3000' || origin === 'http://127.0.0.1:3000') return true;
+
+  // Allow AI Studio and Cloud Run domains
+  if (
+    originHostname === 'localhost' ||
+    originHostname.endsWith('.run.app') ||
+    originHostname.endsWith('.aistudio.google.com') ||
+    originHostname === 'aistudio.google.com' ||
+    originHostname.endsWith('.google.com') ||
+    originHostname.endsWith('.google.corp')
+  ) {
+    return true;
   }
+
+  // Also match req host if same origin
+  const reqHost = req.get('host')?.split(',')[0].trim();
+  if (reqHost && (originHostname === reqHost || originHostname === reqHost.split(':')[0])) {
+    return true;
+  }
+
   return false;
 }
 

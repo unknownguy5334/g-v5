@@ -1400,12 +1400,8 @@ export const StepAddCourses: React.FC<StepAddCoursesProps> = React.memo(({
   // so the model can associate a course header from one screenshot with meetings from another.
   const handleProcessScreenshots = async (filesOverride?: UploadedFileItem[]) => {
     if (ocrProcessingRef.current) return;
-    if (authStatus === 'unauthenticated') {
+    if (authStatus === 'unauthenticated' || authStatus === 'unverified') {
       onOpenAuth?.('login');
-      return;
-    }
-    if (authStatus === 'unverified') {
-      onOpenAuth?.('verify');
       return;
     }
     if (authStatus === 'loading') {

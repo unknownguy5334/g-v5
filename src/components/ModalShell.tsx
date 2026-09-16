@@ -10,6 +10,7 @@ interface ModalShellProps {
   description?: string;
   maxWidthClass?: string;
   children: React.ReactNode;
+  autoHeight?: boolean;
 }
 
 export const ModalShell: React.FC<ModalShellProps> = ({
@@ -19,6 +20,7 @@ export const ModalShell: React.FC<ModalShellProps> = ({
   description,
   maxWidthClass = 'max-w-md',
   children,
+  autoHeight = false,
 }) => {
   const modalRef = useModalAccessibility<HTMLDivElement>({ isOpen, onClose, manageHistory: false });
   if (!isOpen) return null;
@@ -34,7 +36,7 @@ export const ModalShell: React.FC<ModalShellProps> = ({
         aria-modal="true"
         aria-labelledby="modal-title"
         tabIndex={-1}
-        className={`gd-modal-shell w-full ${maxWidthClass} flex flex-col text-ink relative h-[min(90dvh,640px)] max-h-[90dvh] overflow-hidden rounded-2xl shadow-xl bg-white`}
+        className={`gd-modal-shell w-full ${maxWidthClass} flex flex-col text-ink relative ${autoHeight ? 'max-h-[92dvh] h-auto' : 'h-[min(90dvh,640px)] max-h-[90dvh]'} overflow-hidden rounded-2xl shadow-xl bg-white`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="z-20 shrink-0 border-b border-line bg-paper px-4 sm:px-6 py-3.5 flex items-center justify-between gap-3">

@@ -1,3 +1,22 @@
+import { safeStorage } from '../utils/safeStorage';
+
+export const GADWAL_AUTH_TOKEN_KEY = 'gadwal_auth_token_v1';
+
+export function getStoredAuthToken(): string | null {
+  return safeStorage.getItem(GADWAL_AUTH_TOKEN_KEY) || safeStorage.sessionGetItem(GADWAL_AUTH_TOKEN_KEY) || null;
+}
+
+export function setStoredAuthToken(token: string): void {
+  if (!token) return;
+  safeStorage.setItem(GADWAL_AUTH_TOKEN_KEY, token);
+  safeStorage.sessionSetItem(GADWAL_AUTH_TOKEN_KEY, token);
+}
+
+export function clearStoredAuthToken(): void {
+  safeStorage.removeItem(GADWAL_AUTH_TOKEN_KEY);
+  safeStorage.sessionRemoveItem(GADWAL_AUTH_TOKEN_KEY);
+}
+
 export class NetworkTimeoutError extends Error {
   readonly code = 'NETWORK_TIMEOUT';
   readonly retryable = true;
@@ -30,8 +49,15 @@ export async function fetchWithTimeout(input: RequestInfo | URL, options: FetchJ
     else parentSignal.addEventListener('abort', onAbort, { once: true });
   }
 
+  const headers = new Headers(init.headers || {});
+  const token = getStoredAuthToken();
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  const credentials = init.credentials || 'include';
+
   try {
-    const response = await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, headers, credentials, signal: controller.signal });
     return response;
   } catch (error) {
     if (timedOut) throw new NetworkTimeoutError();

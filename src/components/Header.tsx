@@ -17,6 +17,7 @@ interface HeaderProps {
   onOpenPromise?: (trigger?: HTMLElement | null) => void;
   onOpenAuth?: (view?: 'login' | 'signup' | 'verify') => void;
   onOpenAccount?: () => void;
+  accessState?: any;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -30,6 +31,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenPromise,
   onOpenAuth,
   onOpenAccount,
+  accessState,
 }) => {
   const { user, status, logout } = useAuth();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -121,27 +123,26 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Auth State Button */}
           {user ? (
             <div className="flex items-center gap-2 border-l border-line pl-3">
+              {accessState && (
+                <div 
+                  className="hidden md:flex items-center gap-1.5 px-2 py-1 text-[11px] font-bold rounded bg-mist text-text-secondary border border-line uppercase tracking-wide cursor-default" 
+                  title={`Access active for ${accessState.term} ${accessState.academicYear}`}
+                >
+                  {accessState.hasAcademicYear ? <span className="text-emerald-700">Year Access</span> :
+                   accessState.hasCurrentTerm ? <span className="text-emerald-700">Term Access</span> :
+                   accessState.hasFreeRun ? <span className="text-accent-strong flex items-center gap-1"><RotateCcw className="w-3 h-3" /> Free Run</span> :
+                   <span className="text-text-muted">No Access</span>}
+                </div>
+              )}
               <div
                 className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-md bg-white border border-line cursor-default"
                 title={`Signed in as ${user.email}`}
               >
                 <User className="w-3.5 h-3.5 text-ink" />
                 <span className="max-w-[120px] truncate text-ink font-medium">{user.name || user.email.split('@')[0]}</span>
-                {user.emailVerified ? (
-                  <span title="Verified MIU Student" className="inline-flex">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-success" />
-                  </span>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => onOpenAuth?.('verify')}
-                    className="flex items-center gap-0.5 text-[10px] text-caution font-bold hover:underline cursor-pointer"
-                    title="Account unverified - click to verify"
-                  >
-                    <AlertCircle className="w-3.5 h-3.5 text-caution" />
-                    <span>Verify</span>
-                  </button>
-                )}
+                <span title="Verified MIU Student" className="inline-flex">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-success" />
+                </span>
               </div>
               {isAdminUser(user) && (
                 <a
@@ -180,18 +181,10 @@ export const Header: React.FC<HeaderProps> = ({
                 type="button"
                 id="header-btn-login"
                 onClick={() => onOpenAuth?.('login')}
-                className="inline-flex items-center gap-1 text-xs font-semibold text-ink hover:text-ink-soft transition-colors cursor-pointer px-2.5 py-1 rounded border border-line hover:bg-mist bg-white"
+                className="inline-flex items-center gap-1 text-xs font-semibold text-white hover:bg-accent-strong transition-colors cursor-pointer px-3 py-1.5 rounded shadow-xs bg-accent"
               >
                 <LogIn className="w-3.5 h-3.5" />
                 <span>Log in</span>
-              </button>
-              <button
-                type="button"
-                id="header-btn-signup"
-                onClick={() => onOpenAuth?.('signup')}
-                className="inline-flex items-center gap-1 text-xs font-semibold text-white bg-accent hover:bg-accent-strong transition-colors cursor-pointer px-2.5 py-1 rounded shadow-xs"
-              >
-                <span>Sign up</span>
               </button>
             </div>
           )}
@@ -303,25 +296,20 @@ export const Header: React.FC<HeaderProps> = ({
                           <p className="text-text-secondary truncate max-w-[170px]">{user.email}</p>
                         </div>
                       </div>
-                      {user.emailVerified ? (
-                        <CheckCircle2 className="w-4 h-4 text-success shrink-0" />
-                      ) : (
-                        <span className="text-[10px] font-bold text-caution bg-caution-soft px-1.5 py-0.5 rounded border border-caution-line">Unverified</span>
-                      )}
+                      <div className="flex flex-col items-end gap-1">
+                        {user.emailVerified && (
+                          <CheckCircle2 className="w-4 h-4 text-success shrink-0" />
+                        )}
+                        {accessState && (
+                          <div className="text-[10px] font-bold uppercase tracking-wide">
+                            {accessState.hasAcademicYear ? <span className="text-emerald-700">Year Access</span> :
+                             accessState.hasCurrentTerm ? <span className="text-emerald-700">Term Access</span> :
+                             accessState.hasFreeRun ? <span className="text-accent-strong">Free Run</span> :
+                             <span className="text-text-muted">No Access</span>}
+                          </div>
+                        )}
+                      </div>
                     </div>
-                    {!user.emailVerified && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsMobileMenuOpen(false);
-                          onOpenAuth?.('verify');
-                        }}
-                        className="w-full px-3.5 py-2 min-h-[40px] flex items-center gap-2 text-xs font-semibold text-caution hover:bg-caution-soft rounded-sm transition text-left cursor-pointer"
-                      >
-                        <AlertCircle className="w-4 h-4 text-caution" />
-                        <span>Verify Student Email</span>
-                      </button>
-                    )}
                     {isAdminUser(user) && (
                       <a
                         href="/admin"
@@ -357,7 +345,7 @@ export const Header: React.FC<HeaderProps> = ({
                     </button>
                   </>
                 ) : (
-                  <div className="p-2 space-y-1.5">
+                  <div className="p-2">
                     <button
                       type="button"
                       id="mobile-menu-login"
@@ -365,20 +353,10 @@ export const Header: React.FC<HeaderProps> = ({
                         setIsMobileMenuOpen(false);
                         onOpenAuth?.('login');
                       }}
-                      className="w-full py-2 px-3 text-center text-xs font-semibold text-ink bg-white border border-line rounded-md hover:bg-mist transition cursor-pointer"
+                      className="w-full py-2 px-3 flex items-center justify-center gap-2 text-xs font-semibold text-white bg-accent hover:bg-accent-strong rounded-md transition shadow-xs cursor-pointer"
                     >
+                      <LogIn className="w-4 h-4" />
                       Log in
-                    </button>
-                    <button
-                      type="button"
-                      id="mobile-menu-signup"
-                      onClick={() => {
-                        setIsMobileMenuOpen(false);
-                        onOpenAuth?.('signup');
-                      }}
-                      className="w-full py-2 px-3 text-center text-xs font-semibold text-white bg-accent hover:bg-accent-strong rounded-md transition shadow-xs cursor-pointer"
-                    >
-                      Create Account
                     </button>
                   </div>
                 )}

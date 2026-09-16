@@ -49,6 +49,7 @@ export interface OptimizerSearchBudget {
   maxCourseSubsetNodes: number;
   maxSectionNodes: number;
   maxResultsRetained: number;
+  maxEstimatesAllowed?: number;
 }
 
 export const DEFAULT_SEARCH_BUDGET: OptimizerSearchBudget = {
@@ -559,6 +560,7 @@ export function runOptimizer({
   if (rawSectionCount > MAX_SECTIONS_INPUT) {
     return {
       allSectionsConsidered: [],
+      allRankedSchedules: [],
       byDayCount: Object.fromEntries(DEFAULT_DAY_BUCKETS.map((day) => [day, []])) as Record<number, OptimizationResult[]>,
       totalFoundByDay: Object.fromEntries(DEFAULT_DAY_BUCKETS.map((day) => [day, 0])),
       totalCombinationsEvaluated: 0,

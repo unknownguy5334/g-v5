@@ -40,7 +40,7 @@
     "test:architecture": "node scripts/verify-source-structure.mjs && node scripts/test-data-state-api-contract.mjs",
     "audit:dependencies": "node scripts/test-dependencies-redteam-25.mjs && npm audit --audit-level=high",
     "verify:release": "node scripts/verify-release-config.mjs && node scripts/test-neon-launch-readiness.mjs && node scripts/verify-final-integration-contract.mjs",
-    "ci:install": "bun install --frozen-lockfile",
+    "ci:install": "npm ci",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx server/db/migrate.ts",
     "test:auth": "tsx scripts/test-auth-security.ts",
@@ -85,7 +85,7 @@
     "@fontsource/inter": "5.3.0",
     "@google/genai": "2.22.0",
     "@tailwindcss/vite": "4.3.3",
-    "@vitejs/plugin-react": "6.1.1",
+    "@vitejs/plugin-react": "^4.3.4",
     "dotenv": "17.4.2",
     "drizzle-orm": "0.45.2",
     "express": "4.22.3",
@@ -114,6 +114,5 @@
   "engines": {
     "node": ">=22",
     "npm": ">=10.9.8"
-  },
-  "packageManager": "npm@10.9.8"
+  }
 }

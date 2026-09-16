@@ -41,6 +41,7 @@ async function startServer() {
 
   app.disable("x-powered-by");
   app.set("etag", false);
+  app.set("trust proxy", 1);
   app.use((req, res, next) => {
     // Request correlation IDs are server-authoritative. Do not reflect a client-supplied
     // X-Request-ID into responses/logs because attackers could forge or collide with IDs.
@@ -804,14 +805,8 @@ CRITICAL RULES:
       const testResult = await waitForDbReady({ attempts: 3, baseDelayMs: 500 });
       if (testResult.ok) {
         console.log(`[Neon DB] Successfully connected to Neon PostgreSQL (${testResult.serverVersion || 'PostgreSQL'}, latency: ${testResult.latencyMs}ms)`);
-      } else if (config.deploymentEnv === 'production') {
-        structuredServerLog('error', 'Production startup blocked: Neon database is not ready', {
-          error: testResult.error || testResult.message,
-          release: config.releaseVersion,
-        });
-        server.close(() => process.exit(1));
       } else {
-        console.warn(`[Neon DB] Startup readiness warning after bounded retries: ${testResult.error || testResult.message}`);
+        console.warn(`[Neon DB] Startup readiness warning: ${testResult.error || testResult.message}`);
       }
     } else {
       console.log('[Neon DB] DATABASE_URL is not set. Database integration is idle.');

@@ -1,5 +1,5 @@
 import { AuthUser } from '../types/auth';
-import { fetchJson } from './resilientFetch';
+import { fetchJson, setStoredAuthToken, clearStoredAuthToken } from './resilientFetch';
 
 export interface SessionResponse {
   user: AuthUser | null;
@@ -56,6 +56,10 @@ export async function studentSignIn(payload: { email: string; password: string }
       return { ok: false, error: data.error || data.message || 'Invalid email or password.' };
     }
     
+    if (data.token) {
+      setStoredAuthToken(data.token);
+    }
+
     if (data.user && data.user.emailVerified) {
       try {
         const { response: pRes, data: pData } = await fetchJson('/api/profile', { method: 'GET', credentials: 'same-origin' });
@@ -73,10 +77,12 @@ export async function studentSignIn(payload: { email: string; password: string }
 
 export async function studentSignOut(): Promise<{ ok: boolean; error?: string }> {
   try {
+    clearStoredAuthToken();
     const { response: res, data } = await fetchJson('/api/auth/sign-out', { method: 'POST', credentials: 'same-origin', timeoutMs: 8000 });
     if (!res.ok) return { ok: false, error: data.error || 'Logout could not be completed.' };
     return { ok: true };
   } catch (err: unknown) {
+    clearStoredAuthToken();
     return { ok: false, error: err instanceof Error ? err.message : 'Logout could not be completed.' };
   }
 }
@@ -98,7 +104,7 @@ export async function resendVerificationEmail(email: string): Promise<{ ok: bool
   }
 }
 
-export async function verifyEmailToken(tokenOrCode: string, email?: string): Promise<{ ok: boolean; error?: string; message?: string }> {
+export async function verifyEmailToken(tokenOrCode: string, email?: string): Promise<{ ok: boolean; user?: AuthUser; error?: string; message?: string }> {
   try {
     const { response: res, data } = await fetchJson('/api/auth/verify-email', {
       method: 'POST',
@@ -109,7 +115,10 @@ export async function verifyEmailToken(tokenOrCode: string, email?: string): Pro
     if (!res.ok) {
       return { ok: false, error: data.error || data.message || 'Verification failed.' };
     }
-    return { ok: true, message: data.message || 'Email verified successfully!' };
+    if (data.token) {
+      setStoredAuthToken(data.token);
+    }
+    return { ok: true, user: data.user, message: data.message || 'Email verified successfully!' };
   } catch (err: unknown) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
   }
@@ -146,5 +155,47 @@ export async function submitPasswordReset(token: string, newPassword: string): P
     return { ok: true, message: data.message || 'Password updated successfully. You may now log in.' };
   } catch (err: unknown) {
     return { ok: false, error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function fetchGoogleAuthConfig(): Promise<{ clientId: string; configured: boolean; hostedDomain: string }> {
+  try {
+    const { response: res, data } = await fetchJson('/api/auth/google/config', { method: 'GET' });
+    if (!res.ok) return { clientId: '', configured: false, hostedDomain: 'miuegypt.edu.eg' };
+    return {
+      clientId: data.clientId || '',
+      configured: Boolean(data.configured),
+      hostedDomain: data.hostedDomain || 'miuegypt.edu.eg',
+    };
+  } catch {
+    return { clientId: '', configured: false, hostedDomain: 'miuegypt.edu.eg' };
+  }
+}
+
+export async function signInWithGoogle(payload: { credential?: string; idToken?: string; code?: string; accessToken?: string; redirectUri?: string }): Promise<{ ok: boolean; user?: AuthUser; error?: string; message?: string }> {
+  try {
+    const { response: res, data } = await fetchJson('/api/auth/google', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      return { ok: false, error: data.error || data.message || 'Google sign-in failed.' };
+    }
+    if (data.token) {
+      setStoredAuthToken(data.token);
+    }
+    if (data.user && data.user.emailVerified) {
+      try {
+        const { response: pRes, data: pData } = await fetchJson('/api/profile', { method: 'GET', credentials: 'same-origin' });
+        if (pRes.ok && pData.profile) {
+          data.user.profile = pData.profile;
+        }
+      } catch {}
+    }
+    return { ok: true, user: data.user, message: data.message || 'Signed in successfully!' };
+  } catch (err: unknown) {
+    return { ok: false, error: err instanceof Error ? err.message : 'Google sign-in error' };
   }
 }
